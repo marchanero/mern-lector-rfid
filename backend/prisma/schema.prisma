@@ -9,6 +9,6 @@ datasource db {
 
 model RFIDTag {
   id        String   @id @default(cuid())
-  tagId     String   @unique
+  tagId     String
   timestamp DateTime @default(now())
 }
