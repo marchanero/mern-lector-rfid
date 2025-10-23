@@ -41,109 +41,6 @@ async function checkSerialPorts() {
   }
 }
 
-// Inicializar puerto serial y configurar event listeners
-async function setupSerialPort() {
-  port = await initializeSerialPort();
-
-  if (port) {
-    // Buffer para acumular datos del puerto serial
-    let serialBuffer = '';
-
-    // Función para extraer objetos JSON completos del buffer
-    function extractCompleteJSONs(buffer) {
-      const jsons = [];
-      let startIndex = 0;
-      let braceCount = 0;
-      let inString = false;
-      let escapeNext = false;
-
-      for (let i = 0; i < buffer.length; i++) {
-        const char = buffer[i];
-
-        if (escapeNext) {
-          escapeNext = false;
-          continue;
-        }
-
-        if (char === '\\') {
-          escapeNext = true;
-          continue;
-        }
-
-        if (char === '"' && !escapeNext) {
-          inString = !inString;
-          continue;
-        }
-
-        if (!inString) {
-          if (char === '{') {
-            if (braceCount === 0) {
-              startIndex = i;
-            }
-            braceCount++;
-          } else if (char === '}') {
-            braceCount--;
-            if (braceCount === 0) {
-              // Encontramos un objeto JSON completo
-              const jsonStr = buffer.substring(startIndex, i + 1);
-              jsons.push(jsonStr);
-              startIndex = i + 1;
-            }
-          }
-        }
-      }
-
-      // Retornar los JSONs encontrados y el buffer restante
-      const remainingBuffer = buffer.substring(startIndex);
-      return { jsons, remainingBuffer };
-    }
-
-    // Leer datos del puerto serial
-    port.on('data', async (data) => {
-      serialBuffer += data.toString();
-
-      // Extraer JSONs completos del buffer
-      const { jsons, remainingBuffer } = extractCompleteJSONs(serialBuffer);
-      serialBuffer = remainingBuffer;
-
-      for (let jsonStr of jsons) {
-        console.log('📡 JSON completo recibido:', jsonStr);
-        try {
-          const jsonData = JSON.parse(jsonStr);
-          console.log('🔍 JSON parseado:', jsonData);
-
-          // Procesar según el evento
-          if (jsonData.event === 'card_detected' && jsonData.uid) {
-            const tagId = jsonData.uid;
-            console.log('🎯 Tag ID detectado:', tagId);
-
-            try {
-              const newTag = await prisma.rFIDTag.create({
-                data: { tagId },
-              });
-              console.log('💾 Tag guardado en DB:', newTag);
-
-              // Emitir evento a todos los clientes conectados
-              io.emit('new_tag', newTag);
-              console.log('📤 Evento new_tag emitido:', newTag);
-            } catch (error) {
-              console.error('❌ Error guardando tag:', error);
-            }
-          } else if (jsonData.event === 'card_removed') {
-            console.log('👋 Tarjeta removida:', jsonData.uid);
-            // Opcional: emitir evento de remoción
-            io.emit('tag_removed', { tagId: jsonData.uid });
-          } else {
-            console.log('ℹ️  Evento no procesado:', jsonData.event);
-          }
-        } catch (error) {
-          console.error('❌ Error parseando JSON:', error.message, 'JSON:', jsonStr);
-        }
-      }
-    });
-  }
-}
-
 app.use(cors());
 app.use(express.json());
 
@@ -289,16 +186,40 @@ async function setupSerialPort() {
             console.log('🎯 Tag ID detectado:', tagId);
 
             try {
-              const newTag = await prisma.rFIDTag.create({
-                data: { tagId },
+              // Verificar si la tarjeta ya existe
+              let tag = await prisma.rFIDTag.findUnique({
+                where: { tagId },
+                include: { user: true }
               });
-              console.log('💾 Tag guardado en DB:', newTag);
+
+              if (tag) {
+                // La tarjeta ya existe, actualizar timestamp y emitir evento
+                tag = await prisma.rFIDTag.update({
+                  where: { tagId },
+                  data: { timestamp: new Date() },
+                  include: { user: true }
+                });
+                console.log('🔄 Tag existente actualizado:', tag);
+              } else {
+                // Crear nueva tarjeta
+                tag = await prisma.rFIDTag.create({
+                  data: { tagId },
+                  include: { user: true }
+                });
+                console.log('💾 Tag nuevo guardado en DB:', tag);
+              }
 
               // Emitir evento a todos los clientes conectados
-              io.emit('new_tag', newTag);
-              console.log('📤 Evento new_tag emitido:', newTag);
+              io.emit('rfid-detected', {
+                tagId: tag.tagId,
+                timestamp: tag.timestamp,
+                user: tag.user,
+                type: jsonData.type || 'Desconocido',
+                size: jsonData.size || 0
+              });
+              console.log('📤 Evento rfid-detected emitido:', tag);
             } catch (error) {
-              console.error('❌ Error guardando tag:', error);
+              console.error('❌ Error procesando tag:', error);
             }
           } else if (jsonData.event === 'card_removed') {
             console.log('👋 Tarjeta removida:', jsonData.uid);
@@ -370,9 +291,145 @@ function extractCompleteJSONs(buffer) {
 // API para obtener tags
 app.get('/api/tags', async (req, res) => {
   const tags = await prisma.rFIDTag.findMany({
-    orderBy: { timestamp: 'desc' }
+    orderBy: { timestamp: 'desc' },
+    include: { user: true }
   });
   res.json(tags);
+});
+
+// API para usuarios
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      include: { rfidTag: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(users);
+  } catch (error) {
+    console.error('Error obteniendo usuarios:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+app.post('/api/users', async (req, res) => {
+  const { name, email } = req.body;
+
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Nombre y email son requeridos' });
+  }
+
+  try {
+    const newUser = await prisma.user.create({
+      data: { name, email },
+      include: { rfidTag: true }
+    });
+    res.json(newUser);
+  } catch (error) {
+    console.error('Error creando usuario:', error);
+    if (error.code === 'P2002') {
+      res.status(400).json({ error: 'El email ya está registrado' });
+    } else {
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  }
+});
+
+app.post('/api/users/:userId/assign-tag', async (req, res) => {
+  const { userId } = req.params;
+  const { tagId } = req.body;
+
+  if (!tagId) {
+    return res.status(400).json({ error: 'tagId es requerido' });
+  }
+
+  try {
+    // Verificar que el usuario existe
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Verificar que la tarjeta existe y no está asignada
+    const tag = await prisma.rFIDTag.findUnique({
+      where: { tagId }
+    });
+
+    if (!tag) {
+      return res.status(404).json({ error: 'Tarjeta no encontrada' });
+    }
+
+    if (tag.userId) {
+      return res.status(400).json({ error: 'La tarjeta ya está asignada a otro usuario' });
+    }
+
+    // Asignar la tarjeta al usuario
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: { rfidTagId: tag.id },
+      include: { rfidTag: true }
+    });
+
+    // Actualizar la tarjeta con el userId
+    await prisma.rFIDTag.update({
+      where: { id: tag.id },
+      data: { userId: userId }
+    });
+
+    // Emitir evento de asignación
+    io.emit('tag-assigned', {
+      tagId: tag.tagId,
+      user: { id: updatedUser.id, name: updatedUser.name, email: updatedUser.email }
+    });
+
+    res.json(updatedUser);
+  } catch (error) {
+    console.error('Error asignando tarjeta:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+app.post('/api/users/:userId/unassign-tag', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { rfidTag: true }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    if (!user.rfidTagId) {
+      return res.status(400).json({ error: 'El usuario no tiene una tarjeta asignada' });
+    }
+
+    // Desasignar la tarjeta
+    await prisma.user.update({
+      where: { id: userId },
+      data: { rfidTagId: null }
+    });
+
+    await prisma.rFIDTag.update({
+      where: { id: user.rfidTagId },
+      data: { userId: null }
+    });
+
+    // Emitir evento de desasignación
+    io.emit('tag-assigned', {
+      tagId: user.rfidTag.tagId,
+      user: null // Usuario es null cuando se desasigna
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error desasignando tarjeta:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
 });
 
 // Endpoint de prueba para simular detección de tarjeta (solo para desarrollo)
